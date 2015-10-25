@@ -1,0 +1,321 @@
+---
+title: "Practical Machine Learning Project"
+author: "Shafiq Ahmed"
+date: "Friday, October 16, 2015"
+output:
+  html_document:
+    fig_height: 6
+    fig_width: 8
+---
+
+<h3>1. Introduction</h3>
+Here we perform modeling for *"Qualitative Activity Recognition of Weight Lifting Exercises"*, paper written by Eduardo Velloso et. al. We use  **principal component analysis (PCA)** for feature selection and **random forest** method for the model. The authors claim, while activity recognition is common by *pca*, recognizing the quality of it is harder task. In this experiment, there are 5 types of observations. One set is categorized as *right-way-of-doing-weight-exercise*, and four sets are four types of *wrong-way-of-doing-weight-exercise*. Our goal is to develop a model, which will predict the result of an observation, (which has 160 parameters) to be right exercise, or a wrong exercise; if wrong, what type of fault.
+<br><br>
+Six male subjects performed the exercises in five different ways.
+
++----------------+-----------------------------------------+
+| Exercise Way   | Description                             |
++================+=========================================+
+| Class **A**    | Exactly according to the specification  | 
++----------------+-----------------------------------------+
+| Class **B**    | Throwing the elbows to the front        |
++----------------+-----------------------------------------+
+| Class **C**    | Lifting the dumbbell only halfway       |
++----------------+-----------------------------------------+
+| Class **D**    | Lowering the dumbbell only halfway      |
++----------------+-----------------------------------------+
+| Class **E**    | Throwing the hips to the front          |
++----------------+-----------------------------------------+
+
+Each person performed the exercises in {**A**, **B**, **C**, **D**, **E**} ways for 10 times in each way. So, $6 \times 5 \times 10=300$ tasks were performed, and for those tasks, total about 19,000 observations were recorded (a.k.a. training set). For each observation, readings from 4 sensors, **roll, pitch, yaw, raw accelerometer, gyroscope, magnetometer**, and their calculated metrics (96), constituted total 160 columns, of which some are features and some are not. (We will explore this next). 
+
+Using **PCA** and **model** on the training set, we want to predict the result of a **test** observation. The answer should be **A**, **B**, **C**, **D**, or **E**. 
+
+<h3>2. Exploring Data</h3>
+Let us load data and perform basic analysis. Comments can be seen in the code.
+
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+# -------------------------------------------------------------------
+# Load all primary and dependant libraries for caret
+# -------------------------------------------------------------------
+library(ggplot2)
+library(caret)
+library(kernlab)
+library(splines)
+library(ElemStatLearn)
+library(RANN)
+library(Hmisc)
+library(gridExtra)
+library(rattle)
+library(randomForest)
+library(caret)
+library(AppliedPredictiveModeling)
+library(ellipse)
+library(dplyr)
+
+# -------------------------------------------------------------------
+# Load Data and Explore Data
+# -------------------------------------------------------------------
+set.seed(123)
+trainfile <- "pml-training.csv"
+testfile <- "pml-testing.csv"
+training <- read.csv(trainfile)
+testing <- read.csv(testfile)
+```
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+dim(training)                     # About 19K observations. Medium size.
+dim(testing)                      # Small test set; meant for sanity testing.
+
+training[1:3, 1:5]
+testing[1:3, 1:5]
+
+training[1:3, 157:160]
+testing[1:3, 157:160]
+
+table(training$classe)
+```
+
+Did you notice that first and last columns of training and testing datasets are not exactly the same.  We will work on that discrepency.
+
+<h3>3. Preparing Data</h3>
+We noticed that many columns have 'NA' values. We remove them. Then we do **near-zero-variance** check. 
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+# -------------------------------------------------------------------
+# Prepare data: training and testing may have NA. Near-zero-var step.
+# -------------------------------------------------------------------
+training[training=='NA'] <- NA
+training[training==''] <- NA
+testing[testing=='NA'] <- NA
+
+nacols <- colnames(training)[apply(is.na(training), 2, any)]
+nacolsind <- match(nacols, colnames(training))
+trainingWork <- training[, -nacolsind]
+testingWork <- testing[, -nacolsind]
+
+nzv <- nearZeroVar(trainingWork)
+trainingWork <- trainingWork[-nzv]
+testingWork <- testingWork[-nzv]
+
+# -------------------------------------------------------------------
+# We shall work on this feature-set
+# -------------------------------------------------------------------
+colnames(trainingWork)
+```
+
+<h3>4. Partitioning Data</h3>
+We split training data in 80% training set and 20% validation set. We leave the test set (only 20 observations) completely untouched. After we build a model on training set (80% of ~19K observations), we will try it out on validation set (20% of ~19K observations) to do cross-validation. 
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+# -------------------------------------------------------------------
+# Data for (a) training, (b) validation and (3) testing.
+# -------------------------------------------------------------------
+# When we partition trainingWork, we keep 80% of it to train,
+# and 20% of it to try (validate) our model.
+# That way we will be able to do cross-validation, i.e., how good was it.
+#
+# Furthermore, we noticed that column 1, 2, 5, 6, last are not numeric.
+# Let us throw them off for the comfort of PCA analysis.
+set.seed(456)
+trainingSetInd <- createDataPartition(trainingWork$classe, p = 0.80, list=FALSE)
+trainingSet <- trainingWork[trainingSetInd, -c(1,2,5,6)]
+validationSet <- trainingWork[-trainingSetInd, -c(1,2,5,6)]
+testingSet <- testingWork[, -c(1,2,5,6)]
+
+lcol <- ncol(trainingSet)
+lrow <- nrow(trainingSet)
+
+# write.csv(test, file="ttt.csv")  # Very handy to peep into large data size.
+dim(trainingSet)                   # That is the final set we will do PCA + model
+dim(validationSet)                 # That is the final set we will try our model on
+dim(testingSet)                    # That is the final set from field to test
+
+```
+
+<h3>5. Visualization of TrainingSet</h3>
+Before we embark on modeling part, we look at some plots. Some comments are present next to the code and output. Dataset has a lot of observations (rows), about 19K.  It is good for modeling, but too much for plot to handle, especially when we do complex **pair**, or **featurePlot** of **caret** package. (**R** crashes). So, we take average of every 10 rows, and shorten the dataset. But we need to maintain **classe** feature. So, first we split the dataset in 5 blocks (per **A, B, C, D, E**), then do every-10-row-average for each block, and then rbind all 5 blocks to make **df_all**.  Then we plot that **df_all**, which is not exactly **trainingSet**, but represents it for visualization purposes.
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE, fig.width=8}
+# -------------------------------------------------------------------
+# Visualization of training data
+# -------------------------------------------------------------------
+library(dplyr)
+df <- tbl_df(trainingSet)
+# This function grabs rows from df by category ('A', 'B', etc.) 
+# and takes average of every n (=10) rows, using aggregate, list, rep.
+df_get <- function(category, n=10)
+{
+    df_X <- filter(df, df$classe == category)                  # Get all 'A's 
+    df_X <- df_X[, -ncol(df_X)]                                # Trim classe column
+    df_x <- aggregate(df_X,list(rep(1:(nrow(df_X)%/%n+1),each=n,len=nrow(df_X))),mean)[-1];
+    df_x <- mutate(df_x, classe=factor(category))              # Add classe column
+}
+# This is what we plot below.
+# df_get('A')                                                                    #  447x55
+# df_get('B')                                                                    #  304x55
+# df_get('C')                                                                    #  274x55
+# df_get('D')                                                                    #  258x55
+# df_get('E')                                                                    #  289x55
+df_all <- rbind(df_get('A'), df_get('B'), df_get('C'), df_get('D'), df_get('E')) # 1572x55
+
+colTot <- c(6, 19, 32, 45)
+print(df_all[1:3, colTot])
+
+colYaw <- c(5, 18, 31, 44)
+print(df_all[1:3, colYaw])
+```
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE, fig.width=8, fig.height=3, fig.align='center'}
+# -------------------------------------------------------------------
+# PLOT 1: Density for Accelerometer Total metrics (arm, belt, dumbbell, forearm)
+# -------------------------------------------------------------------
+transparentTheme(trans = .9)
+featurePlot(x = df_all[, colTot], y=df_all$classe, plot="density", 
+            scales=list(x=list(relation="free"), y=list(relation="free")), 
+            adjust=1.5, pch="|", layout=c(4, 1), auto.key=list(columns=5))
+
+```
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE, fig.width=7, fig.height=7, fig.align='center'}
+# -------------------------------------------------------------------
+# PLOT 2: Pair for yaw metrics (arm, belt, dumbbell, forearm)
+# -------------------------------------------------------------------
+transparentTheme(trans = .4)
+featurePlot(x=df_all[, colYaw], y=df_all$classe, plot="ellipse", auto.key=list(columns=5))
+```
+
+<h3>6. Principal Component Analysis</h3>
+Now we use **preProcess** from **caret** package on **trainingSet**, which has 55 columns. Summary of `preProc` shows that total 25 components (features) captured 95% of the variance.
+
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+# -------------------------------------------------------------------
+# PRINCIPAL COMPONENT ANALYSIS
+# -------------------------------------------------------------------
+preProc <- preProcess(trainingSet[, -lcol], method="pca", num=15)
+print(preProc)
+trainPCA <- predict(preProc, trainingSet[, -lcol])
+dim(trainPCA)
+```
+
+<h3>7. Model Fitting</h3>
+We use `randomForest` from **randomForest** package. Alternatively, we could use `train(method="rf")` but that takes much longer time for some default values which are not accessible from interface. 
+
+<h5>**How I built my model**</h5>
+I choose **random forest** because of its reputation of accuracy. I experimented with **glm** model, but random forest was the final choice. It is a slow process, because it creates $n=500$ trees, with $s=5$ variables, and it becomes an intensive computation.
+
+<h5>**How I used cross-validation**</h5> 
+I used 80% of training data as pure training set, and 20% as validation set. That allowed a nice little cross-validation matrix, with some plots. (See Section 9).
+
+<h5>**What I think expected out of sample error is**</h5> 
+Expected out of sample error was demonstrated by the validation set in cross-validation step. (Section 9). Locate `print(confusion)` and the first matrix output. That describes that out-of-sample error was very small.
+
+<h5>**Why I made the choice I did**</h5> 
+I followed the classnotes, and it seemed to me that the following are conventional steps of modeling. 
+
+
+- Explore data
+- Preprocess data
+- Build PCA data
+- Feed PCA and trainset to a model
+- Do some cross-validation
+- Do a real-field test.
+
+I do not know any more than that. So, I followed those steps. Perhaps reading the *Elements of Statistics* will improve my understanding.
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+# -------------------------------------------------------------------
+# MODEL FIT: Using Random Forest
+# -------------------------------------------------------------------
+mfBegin <- proc.time()
+modelFit <- randomForest(trainingSet$classe ~ ., data=trainPCA)
+print(proc.time() - mfBegin)
+
+# USING caret package takes extra long time.
+# mfCaretBegin <- proc.time()
+# modelFitCaret <- train(trainingSet$classe ~ ., method="rf", data=trainPCA)
+# print(proc.time() - mfCaretBegin)              # Takes extra long time
+# -----------------------
+#    user  system elapsed 
+# 4107.97   35.69 4158.13
+# -----------------------
+```
+
+<h3>8. Reviewing Model Metrics</h3>
+From the output below: 
+
+- Random forest algorithm used 500 trees, and 5 variables at each split. The convergence of the tree leveled out at tree=200 or so. So, we could improve performance by specifying tree number to 250 or so.
+
+- Class **A** was the most predicted values. 
+
+- The importance of the 25 principal component ranged from about 150 to 850 (some were quite more important or influential than the others).
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE, fig.width=8, fig.height=4, fig.align='center'}
+print(modelFit)
+
+#--------------------------------------------------------------------
+# PLOT 3: Plots of Model metrics
+# -------------------------------------------------------------------
+old.par <- par(mfrow=c(1, 3))
+plot(modelFit, main="Convergence Rate")
+plot(modelFit$predicted, main="Predicted Values")
+plot(modelFit$importance, main="PCA importance")
+par(old.par)
+```
+
+<h3>9. Validation, Cross-validation, Out-of-Sample Error</h3>
+From **confusion matrix** below, we notice that number of false positives are very small. The key metrics are as follows: 
+
+$$accuracy=0.9814$$ 
+$$Kappa=0.9765$$
+$$Sensitivity={0.9901_{A}, 0.9750_{B}, 0.9693_{C}, 0.9767_{D}, 0.9903_{E}}$$
+$$Specificity={0.9979_{A}, 0.9946_{B}, 0.9914_{C}, 0.9942_{D}, 0.9991_{E}}$$
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE, fig.width=8, fig.height=4, fig.align='center'}
+validPC <- predict(preProc, validationSet)
+validPred <- predict(modelFit, validPC)
+confusion <- confusionMatrix(validPred, validationSet$classe)
+print(confusion$overall)
+print(confusion)
+
+#--------------------------------------------------------------------
+# PLOT 4: Plots of Confusion matrix
+# -------------------------------------------------------------------
+old.par <- par(mfrow=c(1, 2))
+plot(confusion$table, main="Confusion Matrix table")
+plot(confusion$byClass, main="Sensitivity and Specifity metrics")
+par(old.par)
+```
+
+<h3>10. Final Answer</h3>
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+# -------------------------------------------------------------------
+# PREDICTION: Using test data set (Finally: Independant)
+# -------------------------------------------------------------------
+testPC <- predict(preProc, testingSet)
+testPred <- predict(modelFit, testPC)
+print(testPred)
+```
+
+```{r, warning=FALSE, message=FALSE, echO=TRUE}
+# -------------------------------------------------------------------
+# GENERATING ANSWER FILES
+# -------------------------------------------------------------------
+answers <- as.vector(testPred)
+pml_write_files = function(x) {
+    n = length(x)
+    for (i in 1:n) {
+        filename = paste("problem_id_", i, ".txt", sep='')
+        write.table(x[i], file=filename, quote=FALSE, row.names=FALSE, col.names=FALSE)
+    }
+}
+pml_write_files(answers)
+```
+
+<h3>Conclusion</h3>
+The prediction was good, based on cross-validation. That is wonderful. **B**, **C**, **D**, and **E** are for faulty exercises. But that is only 4 types of faults.  If the subject does some other types of faulty exercise, say puts two hands behind the trunk, with one leg up, then what will the model predict? (It has only 5 choices.) For that reason, how it is a *qualitative activity recognition*, that is not clear. In the original document, Eduardo Velloso et. al. at the end used Kinect sdk to write a C# program. That uses 13 joints and operators Kinect analysis to recognize *correctness* of a task. Per the [document](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) it did not appear to use PCA+modeling for the Kinect sample app.
+
+Nevertheless, it was a good read. 
